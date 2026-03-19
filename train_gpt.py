@@ -42,6 +42,7 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 0))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -446,8 +447,10 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, max_files: int = 0):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if max_files > 0:
+            self.files = self.files[:max_files]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
@@ -477,11 +480,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, max_files: int = 0):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, max_files=max_files)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -811,12 +814,16 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    active_train_files = min(actual_train_files, args.max_train_shards) if args.max_train_shards > 0 else actual_train_files
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(
+        f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files} "
+        f"active_train_shards:{active_train_files}"
+    )
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
@@ -913,7 +920,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, max_files=args.max_train_shards)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -958,7 +965,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, max_files=args.max_train_shards)
 
     # -----------------------------
     # MAIN TRAINING LOOP

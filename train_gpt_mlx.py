@@ -44,6 +44,7 @@ class Hyperparameters:
     # Data / tokenizer.
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    max_train_shards: int = int(os.environ.get("MAX_TRAIN_SHARDS", 0))
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
@@ -212,10 +213,13 @@ class TokenStream:
     def __init__(
         self,
         pattern: str,
+        max_files: int = 0,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
     ):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if max_files > 0:
+            self.files = self.files[:max_files]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.epoch = 1
@@ -254,10 +258,11 @@ class TokenLoader:
     def __init__(
         self,
         pattern: str,
+        max_files: int = 0,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
     ):
-        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.stream = TokenStream(pattern, max_files=max_files, log_fn=log_fn, dataset_name=dataset_name)
 
     def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
         usable = (batch_tokens // seq_len) * seq_len
@@ -857,6 +862,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
+    active_train_files = min(actual_train_files, args.max_train_shards) if args.max_train_shards > 0 else actual_train_files
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
@@ -868,7 +874,12 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    train_loader = TokenLoader(
+        args.train_files,
+        max_files=args.max_train_shards,
+        log_fn=log,
+        dataset_name=dataset_name,
+    )
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -909,15 +920,22 @@ def main() -> None:
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
     if expected_train_files is None:
-        log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
+        log(
+            f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files} "
+            f"active_train_shards:{active_train_files}"
+        )
     elif actual_train_files < expected_train_files:
         log(
             f"WARNING: train_loader:subset dataset:{dataset_name} "
             f"train_shards:{actual_train_files}/{expected_train_files} "
+            f"active_train_shards:{active_train_files} "
             f"new epochs will arrive sooner than the full dataset"
         )
     else:
-        log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
+        log(
+            f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files} "
+            f"active_train_shards:{active_train_files}"
+        )
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
@@ -981,7 +999,12 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(
+            args.train_files,
+            max_files=args.max_train_shards,
+            log_fn=log,
+            dataset_name=dataset_name,
+        )
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
