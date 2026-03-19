@@ -30,6 +30,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import train_gpt as base
 
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:
+    create_block_mask = None
+    flex_attention = None
+
 
 class Hyperparameters:
     # Data / tokenizer.
@@ -42,7 +48,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 24_576))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 196_608))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
@@ -50,7 +56,8 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 1000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 100))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 5))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 6_144))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 1))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 24_576))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 768))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 0.0))
 
@@ -58,6 +65,8 @@ class Hyperparameters:
     local_attn_window = int(os.environ.get("LOCAL_ATTN_WINDOW", 512))
     global_tokens = int(os.environ.get("GLOBAL_TOKENS", 16))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    use_flex_attention = bool(int(os.environ.get("USE_FLEX_ATTENTION", "1")))
+    flex_block_size = int(os.environ.get("FLEX_BLOCK_SIZE", 128))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -87,6 +96,20 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
 
+def local_global_mask(
+    local_window: int,
+    global_tokens: int,
+    q_idx: Tensor,
+    kv_idx: Tensor,
+) -> Tensor:
+    causal = kv_idx <= q_idx
+    local_start = torch.clamp(q_idx - local_window + 1, min=0)
+    local = kv_idx >= local_start
+    global_mask = kv_idx < global_tokens
+    allowed = causal & (local | global_mask)
+    return allowed
+
+
 def build_local_global_attn_bias(
     seq_len: int,
     local_window: int,
@@ -95,11 +118,7 @@ def build_local_global_attn_bias(
 ) -> Tensor:
     q_idx = torch.arange(seq_len, device=device)
     k_idx = torch.arange(seq_len, device=device)
-    causal = k_idx[None, :] <= q_idx[:, None]
-    local_start = torch.clamp(q_idx - local_window + 1, min=0)
-    local = k_idx[None, :] >= local_start[:, None]
-    global_mask = k_idx[None, :] < global_tokens
-    allowed = causal & (local | global_mask)
+    allowed = local_global_mask(local_window, global_tokens, q_idx[:, None], k_idx[None, :])
     bias = torch.zeros((seq_len, seq_len), device=device, dtype=torch.float32)
     bias.masked_fill_(~allowed, torch.finfo(torch.float32).min)
     return bias[None, None, :, :]
@@ -127,6 +146,8 @@ class LocalGlobalCausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         self.local_window = local_window
         self.global_tokens = global_tokens
+        self.use_flex_attention = create_block_mask is not None and flex_attention is not None
+        self.flex_block_size = 128
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = base.CastedLinear(dim, dim, bias=False)
         self.c_k = base.CastedLinear(dim, kv_dim, bias=False)
@@ -134,6 +155,52 @@ class LocalGlobalCausalSelfAttention(nn.Module):
         self.proj = base.CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.rotary = base.Rotary(self.head_dim, base=rope_base)
+        self._block_mask_cache: dict[tuple[int, torch.device], object] = {}
+        self._attn_bias_cache: dict[tuple[int, torch.device], Tensor] = {}
+
+    def configure_backend(self, *, use_flex_attention: bool, flex_block_size: int) -> None:
+        self.use_flex_attention = use_flex_attention and create_block_mask is not None and flex_attention is not None
+        self.flex_block_size = flex_block_size
+
+    def _get_block_mask(self, seq_len: int, device: torch.device):
+        key = (seq_len, device)
+        if key not in self._block_mask_cache:
+            if create_block_mask is None:
+                raise RuntimeError("flex_attention BlockMask utilities are unavailable")
+            local_window = self.local_window
+            global_tokens = self.global_tokens
+
+            def mask_mod(batch: Tensor, head: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+                del batch, head
+                return local_global_mask(local_window, global_tokens, q_idx, kv_idx)
+
+            self._block_mask_cache[key] = create_block_mask(
+                mask_mod,
+                1,
+                self.num_heads,
+                seq_len,
+                seq_len,
+                device=device,
+                BLOCK_SIZE=self.flex_block_size,
+            )
+        return self._block_mask_cache[key]
+
+    def _get_math_bias(self, seq_len: int, device: torch.device) -> Tensor:
+        key = (seq_len, device)
+        if key not in self._attn_bias_cache:
+            self._attn_bias_cache[key] = build_local_global_attn_bias(
+                seq_len,
+                local_window=self.local_window,
+                global_tokens=self.global_tokens,
+                device=device,
+            )
+        return self._attn_bias_cache[key]
+
+    def prepare_attention(self, seq_len: int, device: torch.device) -> None:
+        if self.use_flex_attention:
+            self._get_block_mask(seq_len, device)
+        else:
+            self._get_math_bias(seq_len, device)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -145,21 +212,26 @@ class LocalGlobalCausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = base.apply_rotary_emb(q, cos, sin)
         k = base.apply_rotary_emb(k, cos, sin)
-        attn_bias = build_local_global_attn_bias(
-            seqlen,
-            local_window=self.local_window,
-            global_tokens=self.global_tokens,
-            device=x.device,
-        )
-        with sdpa_kernel(SDPBackend.MATH):
-            y = F.scaled_dot_product_attention(
+        if self.use_flex_attention:
+            block_mask = self._get_block_mask(seqlen, x.device)
+            y = flex_attention(
                 q,
                 k,
                 v,
-                attn_mask=attn_bias,
-                is_causal=False,
+                block_mask=block_mask,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
+        else:
+            attn_bias = self._get_math_bias(seqlen, x.device)
+            with sdpa_kernel(SDPBackend.MATH):
+                y = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_bias,
+                    is_causal=False,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -256,6 +328,17 @@ class LocalAttentionGPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def configure_attention_backend(self, *, use_flex_attention: bool, flex_block_size: int) -> None:
+        for block in self.blocks:
+            block.attn.configure_backend(
+                use_flex_attention=use_flex_attention,
+                flex_block_size=flex_block_size,
+            )
+
+    def prepare_attention(self, seq_len: int, device: torch.device) -> None:
+        for block in self.blocks:
+            block.attn.prepare_attention(seq_len, device)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -292,15 +375,15 @@ def main() -> None:
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
-    rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ and world_size > 1
+    rank = int(os.environ.get("RANK", "0")) if distributed else 0
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if args.grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {args.grad_accum_steps}")
+    grad_accum_steps = args.grad_accum_steps if not distributed or "GRAD_ACCUM_STEPS" in os.environ else max(1, 8 // world_size)
     grad_scale = 1.0 / grad_accum_steps
     local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
     if local_train_tokens < args.train_seq_len:
@@ -399,11 +482,16 @@ def main() -> None:
         local_window=args.local_attn_window,
         global_tokens=args.global_tokens,
     ).to(device).bfloat16()
+    base_model.configure_attention_backend(
+        use_flex_attention=args.use_flex_attention,
+        flex_block_size=args.flex_block_size,
+    )
+    base_model.prepare_attention(args.train_seq_len, device)
     for module in base_model.modules():
         if isinstance(module, base.CastedLinear):
             module.float()
     base.restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
@@ -456,12 +544,17 @@ def main() -> None:
         optimizers.append(optimizer_scalar)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    local_batch_seqs = local_train_tokens // args.train_seq_len
     log0(f"model_params:{n_params}")
-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(
+        f"world_size:{world_size} distributed:{distributed} grad_accum_steps:{grad_accum_steps} "
+        f"local_batch_seqs:{local_batch_seqs}"
+    )
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"attention_mode:local_global num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"local_window:{args.local_attn_window} global_tokens:{args.global_tokens}"
+        f"local_window:{args.local_attn_window} global_tokens:{args.global_tokens} "
+        f"backend:{'flex_attention' if args.use_flex_attention and create_block_mask is not None and flex_attention is not None else 'sdpa_math'}"
     )
     log0(
         f"mlp:swi_glu hidden_dim:{args.mlp_hidden_dim} tie_embeddings:{args.tie_embeddings} "
